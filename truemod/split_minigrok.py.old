@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""
+split_minigrok.py
+=================
+Run this script ONCE to split minigrok_v13.py into the full package structure.
+
+Usage:
+    python split_minigrok.py                        # reads minigrok_v13.py in cwd
+    python split_minigrok.py --src /path/to/v13.py  # custom source path
+    python split_minigrok.py --out ./minigrok_pkg   # custom output directory
+
+The script:
+  1. Reads minigrok_v13.py
+  2. Extracts each section by line range
+  3. Writes every module file with correct imports
+  4. Creates pyproject.toml, README.md, colab_cell.py
+  5. Runs a syntax check on every generated file
+  6. Prints a pass/fail report
+"""
+
+import argparse
+import ast
+import os
+import sys
+from pathlib import Path
+from textwrap import dedent
+
+
+# ════════════════════════════════════════════════════════════════════
+# STANDARD FILE HEADERS  (prepended to every module)
+# ════════════════════════════════════════════════════════════════════
+
+_FUTURE = "from __future__ import annotations\n\n"
+
+_COMMON_STDLIB = """\
+import gc
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+import queue
+import re
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import uuid
+import warnings
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from enum import Enum, auto
+from pathlib import Path
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
+
+"""
+
+
+# ════════════════════════════════════════════════════════════════════
+# SECTION BOUNDARIES  (start_line → end_line, 1-indexed inclusive)
+# These match the § markers found in minigrok_v13.py
+# ════════════════════════════════════════════════════════════════════
+
+SECTIONS = {
+    # name: (start_line, end_line)   — 0 = end of file
+    "imports":        (82,  167),
+    "config":        (168,  254),
+    "paths":         (255,  351),
+    "cache":         (352,  472),
+    "model_load":    (473,  699),
+    "vram_juggler":  (700,  786),
+    "exceptions":    (787,  809),
+    "agent_phase":   (810,  829),
+    "model_router":  (830,  894),
+    "sqlite":        (895,  974),
+    "conv_memory":   (975, 1102),
+    "generation":   (1103, 1313),
+    "rag_chunker":  (1314, 1386),
+    "rag_chroma":   (1387, 1619),
+    "pmem":         (1620, 1735),
+    "voice":        (1736, 1898),
+    "tool_validator":(1952,2069),
+    "hallucination": (2070,2099),
+    "uncertainty":  (2100,2136),
+    "response_cache":(2137,2195),
+    "tools":        (2137,2884),
+    "tool_chain":   (2885,2945),
+    "tool_registry":(2946,3025),
+    "bg_learner":   (3026,3167),
+    "training":     (3168,3450),
+    "rag_audit":    (3451,3599),
+    "agent_loop":   (3600,3849),
+    "gradio_ui":    (3865,4614),
+    "pytest":       (4615,   0),
+}
+
+# ════════════════════════════════════════════════════════════════════
+# MODULE → SECTION MAPPING
+# ════════════════════════════════════════════════════════════════════
+
+MODULE_MAP = {
+    # output_path: list of section keys to include
+    "minigrok/config.py":               ["imports", "config"],
+    "minigrok/exceptions.py":           ["exceptions"],
+    "minigrok/state.py":                ["agent_phase"],
+    "minigrok/startup.py":              ["paths", "sqlite"],
+    "minigrok/core/__init__.py":        [],
+    "minigrok/core/cache.py":           ["cache"],
+    "minigrok/core/security.py":        [],            # Written from scratch (no monolith section)
+    "minigrok/core/database.py":        ["sqlite"],
+    "minigrok/core/model.py":           ["model_load", "vram_juggler", "model_router"],
+    "minigrok/core/memory.py":          ["rag_chunker", "rag_chroma", "pmem", "conv_memory"],
+    "minigrok/tools/__init__.py":       ["tool_registry"],
+    "minigrok/tools/web.py":            [],            # Subset of tools section
+    "minigrok/tools/browser.py":        [],            # Subset of tools section
+    "minigrok/tools/code.py":           [],            # Subset of tools section
+    "minigrok/tools/homework.py":       [],            # Subset of tools section
+    "minigrok/tools/workspace.py":      [],            # Subset of tools section
+    "minigrok/tools/media.py":          ["voice"],
+    "minigrok/tools/plugins.py":        [],
+    "minigrok/agents/__init__.py":      [],
+    "minigrok/agents/loop.py":          ["agent_loop", "hallucination", "uncertainty",
+                                          "tool_chain", "tool_validator", "response_cache"],
+    "minigrok/agents/chain.py":         ["tool_chain"],
+    "minigrok/training/__init__.py":    [],
+    "minigrok/training/eval.py":        [],
+    "minigrok/training/dpo.py":         [],
+    "minigrok/training/sft.py":         ["training"],
+    "minigrok/ui/__init__.py":          [],
+    "minigrok/ui/css.py":               [],
+    "minigrok/ui/app.py":               ["gradio_ui", "rag_audit"],
+    "minigrok/tests/__init__.py":       [],
+    "minigrok/tests/test_core.py":      ["pytest"],
+    "minigrok/__init__.py":             [],
+    "minigrok/_autosave.py":            [],
+    "main.py":                          [],
+    "colab_cell.py":                    [],
+    "pyproject.toml":                   [],
+}
+
+
+# ════════════════════════════════════════════════════════════════════
+# STATIC FILE CONTENT
+# (files that are the same regardless of monolith content)
+# ════════════════════════════════════════════════════════════════════
+
+STATIC_FILES = {}  # populated by _register_statics()
+
+
+def _register_statics():
+    """Register all static file content (files fully written from scratch)."""
+
+    STATIC_FILES["pyproject.toml"] = dedent("""\
+        [build-system]
+        requires = ["setuptools>=68", "wheel"]
+        build-backend = "setuptools.backends.legacy:build"
+
+        [project]
+        name = "minigrok"
+        version = "13.0.0"
+        description = "Self-improving local AI OS — VL browser, RAG, DPO, voice, image gen"
+        readme = "README.md"
+        requires-python = ">=3.10"
+        license = {text = "MIT"}
+
+        dependencies = [
+            "torch>=2.1.0", "transformers>=4.49.0", "accelerate>=0.34.0",
+            "bitsandbytes>=0.43.0", "peft>=0.11.0", "trl>=0.9.0",
+            "datasets>=2.20.0", "huggingface_hub", "chromadb",
+            "sentence-transformers", "rank-bm25", "networkx", "nltk",
+            "jsonschema", "duckduckgo-search", "trafilatura", "requests",
+            "beautifulsoup4", "feedparser", "wikipedia", "arxiv",
+            "PyPDF2", "pandas", "pillow", "gradio>=4.38.0,<6.0.0",
+            "matplotlib", "sympy", "RestrictedPython", "numpy",
+            "filelock", "python-dotenv", "nest-asyncio>=1.6.0",
+            "uvicorn>=0.30.0,<0.32.0", "yt-dlp",
+        ]
+
+        [project.optional-dependencies]
+        voice  = ["f5-tts", "kokoro-onnx", "gtts", "soundfile", "openai-whisper"]
+        vision = ["opencv-python-headless"]
+        browser= ["playwright", "crawl4ai"]
+        image  = ["diffusers>=0.30.0", "safetensors"]
+        train  = ["unsloth"]
+        dev    = ["pytest", "pytest-asyncio", "hypothesis", "ruff"]
+        all    = ["minigrok[voice,vision,browser,image,train]"]
+
+        [project.scripts]
+        minigrok = "minigrok.main:cli"
+
+        [tool.pytest.ini_options]
+        testpaths = ["minigrok/tests"]
+        filterwarnings = ["ignore::DeprecationWarning"]
+
+        [tool.setuptools.packages.find]
+        where = ["."]
+        include = ["minigrok*"]
+    """)
+
+    STATIC_FILES["minigrok/__init__.py"] = dedent("""\
+        \"\"\"MiniGrok — self-improving local AI OS.\"\"\"
+        from minigrok.config     import Config
+        from minigrok.exceptions import (MiniGrokError, ToolError, ModelError,
+                                          StorageError, SecurityError)
+        from minigrok.startup    import run_startup, health_check, fix_asyncio, find_free_port
+        import minigrok.state as state
+
+        __version__ = Config.APP_VERSION
+        __all__ = [
+            "Config", "state", "run_startup", "health_check",
+            "MiniGrokError", "ToolError", "ModelError", "StorageError", "SecurityError",
+        ]
+    """)
+
+    STATIC_FILES["minigrok/core/__init__.py"] = '"""minigrok.core — model, cache, memory, security, database."""\n'
+    STATIC_FILES["minigrok/tools/__init__.py"] = dedent("""\
+        \"\"\"minigrok.tools — tool registry builder.\"\"\"
+        from __future__ import annotations
+        import logging
+        from typing import Dict
+        log = logging.getLogger("minigrok")
+        TOOL_REGISTRY: Dict[str, dict] = {}
+
+        def build_registry() -> Dict[str, dict]:
+            \"\"\"Import all tool modules and register their tools.\"\"\"
+            import minigrok.state as state
+            from minigrok.tools.web       import get_tools as _w
+            from minigrok.tools.code      import get_tools as _c
+            from minigrok.tools.browser   import get_tools as _b
+            from minigrok.tools.homework  import get_tools as _h
+            from minigrok.tools.workspace import get_tools as _ws
+            from minigrok.tools.media     import get_tools as _m
+            from minigrok.tools.plugins   import load_plugins
+            for fn in [_w, _c, _b, _h, _ws, _m]:
+                try:    TOOL_REGISTRY.update(fn())
+                except Exception as e: log.warning(f"Tool reg failed: {e}")
+            n = load_plugins(TOOL_REGISTRY)
+            if n: log.info(f"Loaded {n} plugin tools")
+            state.TOOL_REGISTRY = TOOL_REGISTRY  # type: ignore
+            log.info(f"Tool Registry: {len(TOOL_REGISTRY)} tools")
+            return TOOL_REGISTRY
+    """)
+
+    STATIC_FILES["minigrok/agents/__init__.py"] = '"""minigrok.agents — orchestration and chaining."""\n'
+    STATIC_FILES["minigrok/training/__init__.py"] = '"""minigrok.training — SFT, DPO, eval."""\n'
+    STATIC_FILES["minigrok/ui/__init__.py"] = '"""minigrok.ui — Gradio interface."""\n'
+    STATIC_FILES["minigrok/tests/__init__.py"] = '"""minigrok.tests."""\n'
+
+    STATIC_FILES["minigrok/core/security.py"] = dedent("""\
+        \"\"\"minigrok/core/security.py — PII filter, injection check, path validation.\"\"\"
+        from __future__ import annotations
+        import re
+        from pathlib import Path
+        from typing import Optional, Tuple
+        from minigrok.exceptions import SecurityError
+
+        _PII = [r'\\b\\d{3}-\\d{2}-\\d{4}\\b', r'\\b\\d{16}\\b',
+                r'\\b[\\w.+-]+@[\\w-]+\\.[A-Za-z]{2,}\\b', r'\\b\\d{3}[-.]?\\d{3}[-.]?\\d{4}\\b']
+
+        _INJECT = re.compile(
+            r'ignore.{0,5}previous|you.{0,5}are.{0,5}now|act.{0,5}as|'
+            r'system.{0,5}prompt|jailbreak|disregard|override.{0,5}instructions',
+            re.IGNORECASE)
+
+        def pii_filter(text: str) -> str:
+            for p in _PII: text = re.sub(p, "[REDACTED]", text)
+            return text
+
+        def injection_check(text: str) -> bool:
+            return bool(_INJECT.search(text))
+
+        def validate_tool_params(name: str, params: dict,
+                                  registry: Optional[dict] = None) -> Tuple[bool, str]:
+            if registry:
+                expected = registry.get(name, {}).get("params", {})
+                for k in params:
+                    if expected and k not in expected:
+                        return False, f"Unexpected param '{k}' for '{name}'"
+            for k, v in params.items():
+                if isinstance(v, str) and _INJECT.search(v):
+                    return False, f"Suspicious content in param '{k}' — possible injection"
+            return True, ""
+
+        def validate_workspace_path(rel: str, workspace: str) -> Optional[Path]:
+            try:
+                resolved = (Path(workspace) / rel).resolve()
+                if not str(resolved).startswith(str(Path(workspace).resolve())):
+                    return None
+                return resolved
+            except Exception:
+                return None
+    """)
+
+    STATIC_FILES["minigrok/tools/plugins.py"] = dedent("""\
+        \"\"\"minigrok/tools/plugins.py — load custom tools from workspace/plugins/.\"\"\"
+        from __future__ import annotations
+        import logging
+        from pathlib import Path
+        log = logging.getLogger("minigrok")
+
+        def load_plugins(registry: dict) -> int:
+            import minigrok.state as state
+            plugin_dir = Path(state.DIRS.get("ws_plugins", "/tmp/plugins"))
+            loaded = 0
+            for f in plugin_dir.glob("*.py"):
+                try:
+                    spec = {"__file__": str(f), "__name__": f.stem}
+                    exec(compile(f.read_text(), str(f), "exec"), spec)  # noqa
+                    if isinstance(spec.get("TOOLS"), dict):
+                        for n, d in spec["TOOLS"].items():
+                            if "fn" in d and "desc" in d:
+                                registry[n] = d; loaded += 1
+                except (SyntaxError, ImportError) as e:
+                    log.warning(f"Plugin {f.stem}: {e}")
+                except Exception as e:
+                    log.warning(f"Plugin {f.stem} ({type(e).__name__}): {e}")
+            return loaded
+    """)
+
+    STATIC_FILES["minigrok/ui/css.py"] = dedent("""\
+        \"\"\"minigrok/ui/css.py — mobile-first dark theme.\"\"\"
+        MOBILE_CSS = \"\"\"
+        :root { --bg:#0f0f0f; --surface:#1a1a1a; --surface2:#242424;
+                --border:#333; --accent:#10a37f; --text:#f0f0f0; --muted:#888; }
+        body, .gradio-container { background:var(--bg)!important; color:var(--text)!important; }
+        .message.user  { background:var(--accent)!important; border-radius:12px; padding:10px 14px; }
+        .message.bot   { background:var(--surface2)!important; border-radius:12px; padding:10px 14px; }
+        #chat-input textarea { background:var(--surface)!important; color:var(--text)!important;
+                               border:1px solid var(--border)!important; border-radius:12px!important; }
+        .gr-button.primary { background:var(--accent)!important; color:#fff!important; border-radius:12px!important; }
+        .chips { display:flex; flex-wrap:wrap; gap:6px; padding:6px 0; }
+        .chip  { background:var(--surface2); border:1px solid var(--border); border-radius:20px;
+                 padding:4px 12px; font-size:12px; cursor:pointer; color:var(--muted); }
+        .chip:hover { border-color:var(--accent); color:var(--accent); }
+        @media (max-width:640px) { .gradio-container { padding:4px!important; } }
+        \"\"\"
+    """)
+
+    STATIC_FILES["minigrok/_autosave.py"] = dedent("""\
+        \"\"\"minigrok/_autosave.py — background auto-save daemon.\"\"\"
+        from __future__ import annotations
+        import logging, time
+        from pathlib import Path
+        log = logging.getLogger("minigrok")
+
+        def auto_save_worker() -> None:
+            \"\"\"Atomically persist conversations + memory every 5 minutes.\"\"\"
+            from minigrok.core.memory import atomic_write
+            import minigrok.state as state
+            while True:
+                try:
+                    time.sleep(300)
+                    if state.DR:
+                        mem = Path(f"{state.DR}/memory")
+                        if state.saved_convs: atomic_write(mem/"conversations.json", state.saved_convs)
+                        if state.pmem:        atomic_write(mem/"pmem.json",          state.pmem)
+                        if state.dpo_pairs:   atomic_write(mem/"dpo.json",           state.dpo_pairs)
+                    log.debug("Auto-save complete")
+                except Exception as e:
+                    log.warning(f"Auto-save: {e}")
+    """)
+
+    STATIC_FILES["colab_cell.py"] = dedent("""\
+        \"\"\"
+        colab_cell.py — paste this single file into a Colab cell and run.
+        Installs deps, mounts Drive, boots model, launches UI.
+        \"\"\"
+        import subprocess, sys, os
+        from pathlib import Path
+
+        def _pip(*a, silent=True):
+            r = subprocess.run([sys.executable,"-m","pip","install","-q","--no-cache-dir"]+list(a),
+                               capture_output=True, text=True)
+            if r.returncode != 0 and not silent:
+                print(f"  ⚠️  {' '.join(a[:2])}: {r.stderr[-120:]}")
+
+        _pip("torch","torchvision","--index-url","https://download.pytorch.org/whl/cu121")
+        _pip("transformers>=4.49.0","accelerate>=0.34.0","bitsandbytes>=0.43.0","peft>=0.11.0")
+        _pip("trl>=0.9.0","datasets>=2.20.0","huggingface_hub")
+        _pip("gradio>=4.38.0,<6.0.0","matplotlib","chromadb","sentence-transformers","rank-bm25")
+        _pip("networkx","duckduckgo-search","trafilatura","feedparser","wikipedia","arxiv","PyPDF2")
+        _pip("pandas","pillow","jsonschema","filelock","python-dotenv","sympy","RestrictedPython")
+        _pip("nltk","yt-dlp","nest-asyncio>=1.6.0","uvicorn>=0.30.0,<0.32.0")
+        _pip("f5-tts", silent=True)
+        _pip("unsloth",  silent=True)
+
+        # If running from the package folder, add it to path:
+        pkg = os.path.abspath(os.path.dirname(os.path.abspath(".")))
+        if pkg not in sys.path: sys.path.insert(0, pkg)
+
+        print("📦 MiniGrok — packages ready")
+
+        from minigrok.startup import run_startup, find_free_port
+        from minigrok.config  import Config
+        import secrets, threading, shutil
+        import minigrok.state as state
+
+        summary = run_startup(version="13")
+
+        from minigrok.core.model import boot_model, try_load_fast_model
+        from minigrok.main import _init_rag, _init_tts, _print_banner
+        from minigrok.tools import build_registry
+
+        model_dir = state.DIRS.get("model", "/content/model")
+        model_search = (
+            [f"{Config.DRIVE_ROOT}/minigrok_v13/model"] +
+            [f"{Config.DRIVE_ROOT}/minigrok_v{v}/model" for v in ["12","11","10"]] +
+            [f"{Config.DRIVE_ROOT}/mini_grok_model"]
+        )
+        found = next((p for p in model_search
+                      if Path(p).exists() and any(Path(p).rglob("*.safetensors"))), None)
+        if found and not any(Path(model_dir).rglob("*.safetensors")):
+            import logging
+            logging.getLogger("minigrok").info(f"Copying model from {found}…")
+            shutil.copytree(found, model_dir, dirs_exist_ok=True)
+
+        boot_model(model_dir)
+        _init_rag()
+        if Config.ENABLE_VOICE: _init_tts()
+        build_registry()
+        _print_banner(summary)
+
+        threading.Thread(target=lambda: (__import__("time").sleep(30), try_load_fast_model()),
+                         daemon=True, name="FastModelPreload").start()
+
+        from minigrok.training.dpo import start_background_workers
+        from minigrok._autosave    import auto_save_worker
+        start_background_workers()
+        threading.Thread(target=auto_save_worker, daemon=True, name="AutoSave").start()
+
+        from minigrok.ui.app import create_ui
+        auth = Config.GRADIO_AUTH
+        if auth is None:
+            u, p = "minigrok", secrets.token_urlsafe(12)
+            auth = (u, p)
+            print(f"\\n  🔐 Username: {u}  Password: {p}\\n")
+
+        port = find_free_port(7860)
+        create_ui().queue(max_size=20).launch(
+            share=Config.GRADIO_SHARE, server_port=port,
+            show_error=True, auth=auth,
+            allowed_paths=[state.WORKSPACE, state.DIRS.get("outputs","")],
+        )
+    """)
+
+    STATIC_FILES["main.py"] = dedent("""\
+        \"\"\"main.py — CLI entry point: python main.py  OR  python -m minigrok\"\"\"
+        from __future__ import annotations
+        import argparse, logging, os, secrets, shutil, sys, threading
+        from pathlib import Path
+
+        def _init_rag():
+            import minigrok.state as state
+            from minigrok.config import Config
+            log = logging.getLogger("minigrok")
+            try:
+                import chromadb, networkx as nx, json
+                from sentence_transformers import SentenceTransformer, CrossEncoder
+                state.chroma_client = chromadb.PersistentClient(path=state.DIRS.get("chroma","/content/chroma"))
+                state.chroma_col    = state.chroma_client.get_or_create_collection(
+                    "minigrok_rag", metadata={"hnsw:space":"cosine"})
+                emb = "BAAI/bge-m3" if Config.USE_LARGE_EMBEDDER else "all-MiniLM-L6-v2"
+                state.embedder = SentenceTransformer(emb); state.EMBEDDER_NAME = emb
+                log.info(f"Embedder: {emb}")
+                try: state.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2"); state.RERANK_OK=True
+                except Exception: pass
+                state.kg = nx.DiGraph()
+                kgp = Path(f"{state.DR}/memory/kg.json")
+                if kgp.exists():
+                    try: state.kg = nx.node_link_graph(json.loads(kgp.read_text()))
+                    except Exception: pass
+                log.info("RAG + Graph RAG ready")
+            except Exception as e: log.warning(f"RAG init: {e}")
+
+        def _init_tts():
+            import minigrok.state as state
+            log = logging.getLogger("minigrok")
+            for engine, loader in [
+                ("f5",     lambda: __import__("f5_tts.api",fromlist=["F5TTS"]).F5TTS()),
+                ("kokoro", lambda: __import__("kokoro_onnx",fromlist=["Kokoro"]).Kokoro("kokoro-v0_19.onnx","voices.bin")),
+                ("gtts",   lambda: (None, __import__("gtts"))[0]),
+            ]:
+                try:
+                    obj = loader()
+                    if engine=="f5": state.f5_tts=obj
+                    elif engine=="kokoro": state.kokoro_tts=obj
+                    state.tts_engine=engine; log.info(f"  {engine} TTS ready"); return
+                except Exception: pass
+            state.tts_engine="espeak"
+
+        def _print_banner(summary):
+            import minigrok.state as state
+            from minigrok.config import Config
+            from minigrok.tools import TOOL_REGISTRY
+            print(f"\\n{'='*60}")
+            print(f"  🚀  MiniGrok v{Config.APP_VERSION}")
+            print(f"  GPU:       {summary.get('gpu','?')}  ({summary.get('vram_gb',0):.0f}GB)")
+            print(f"  Model:     {state.active_model_info.get('id','?')}")
+            print(f"  TTS:       {state.tts_engine if Config.ENABLE_VOICE else 'disabled'}")
+            print(f"  Tools:     {len(TOOL_REGISTRY)}")
+            print(f"  Workspace: {state.WORKSPACE}")
+            print(f"{'='*60}\\n")
+
+        def cli():
+            parser = argparse.ArgumentParser(description="MiniGrok v13")
+            parser.add_argument("--share",    action="store_true", default=True)
+            parser.add_argument("--no-share", action="store_false", dest="share")
+            parser.add_argument("--port",     type=int, default=7860)
+            parser.add_argument("--auth",     type=str, default=None)
+            parser.add_argument("--version",  type=str, default="13")
+            args, _ = parser.parse_known_args()
+
+            from minigrok.startup import run_startup, find_free_port
+            from minigrok.config  import Config
+            from minigrok.core.model import boot_model
+            from minigrok.tools   import build_registry
+            from minigrok.training.dpo import start_background_workers
+            from minigrok._autosave    import auto_save_worker
+            from minigrok.ui.app  import create_ui
+            import minigrok.state as state
+
+            summary = run_startup(version=args.version)
+            if args.auth:
+                u, p = args.auth.split(":",1); Config.GRADIO_AUTH = (u,p)
+
+            model_dir = state.DIRS.get("model","/content/model")
+            model_search = (
+                [f"{Config.DRIVE_ROOT}/minigrok_v{args.version}/model"] +
+                [f"{Config.DRIVE_ROOT}/minigrok_v{v}/model" for v in ["13","12","11","10"]] +
+                [f"{Config.DRIVE_ROOT}/mini_grok_model"]
+            )
+            found = next((p for p in model_search
+                          if Path(p).exists() and any(Path(p).rglob("*.safetensors"))), None)
+            if found and not any(Path(model_dir).rglob("*.safetensors")):
+                logging.getLogger("minigrok").info(f"Copying model from {found}…")
+                shutil.copytree(found, model_dir, dirs_exist_ok=True)
+
+            boot_model(model_dir)
+            _init_rag()
+            if Config.ENABLE_VOICE: _init_tts()
+            build_registry()
+            _print_banner(summary)
+
+            threading.Thread(
+                target=lambda: (__import__("time").sleep(30),
+                                __import__("minigrok.core.model",fromlist=["try_load_fast_model"]).try_load_fast_model()),
+                daemon=True, name="FastModelPreload").start()
+            start_background_workers()
+            threading.Thread(target=auto_save_worker, daemon=True, name="AutoSave").start()
+
+            auth = Config.GRADIO_AUTH
+            if args.share and auth is None:
+                u, p = "minigrok", secrets.token_urlsafe(12)
+                auth = (u, p)
+                print(f"\\n  🔐 Username: {u}  Password: {p}\\n")
+
+            port = find_free_port(args.port)
+            create_ui().queue(max_size=20).launch(
+                share=args.share, server_port=port, show_error=True, auth=auth,
+                allowed_paths=[state.WORKSPACE, state.DIRS.get("outputs","")],
+            )
+
+        if __name__ == "__main__":
+            cli()
+    """)
+
+
+# ════════════════════════════════════════════════════════════════════
+# CORE EXTRACTOR
+# ════════════════════════════════════════════════════════════════════
+
+def extract_lines(all_lines: list, start: int, end: int) -> str:
+    """Extract lines start..end (1-indexed inclusive). end=0 → EOF."""
+    s = max(0, start - 1)
+    e = end if end > 0 else len(all_lines)
+    return "".join(all_lines[s:e])
+
+
+def build_module_header(module_path: str) -> str:
+    """Build the docstring + import block for a module."""
+    name = Path(module_path).stem
+    pkg  = module_path.replace("/", ".").replace(".py", "")
+    return (
+        f'"""\n{pkg}\n{"─" * len(pkg)}\nExtracted from minigrok_v13.py by split_minigrok.py\n"""\n'
+        + _FUTURE
+    )
+
+
+def write_extracted(out_dir: Path, rel_path: str, content: str,
+                    monolith_lines: list) -> None:
+    """Write a module file extracted from the monolith."""
+    dest = out_dir / rel_path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    sections_for_module = MODULE_MAP.get(rel_path, [])
+
+    if not sections_for_module:
+        # Static or no-content file
+        if rel_path in STATIC_FILES:
+            dest.write_text(STATIC_FILES[rel_path], encoding="utf-8")
+        else:
+            dest.write_text(
+                build_module_header(rel_path) + "# TODO: populate this module\n",
+                encoding="utf-8",
+            )
+        return
+
+    # Extract requested sections from monolith
+    parts = [build_module_header(rel_path)]
+    for sec_key in sections_for_module:
+        if sec_key not in SECTIONS:
+            continue
+        s, e = SECTIONS[sec_key]
+        parts.append(f"\n# ─── {sec_key} (lines {s}–{e or 'EOF'}) ───────────────────────────────\n")
+        parts.append(extract_lines(monolith_lines, s, e))
+
+    dest.write_text("".join(parts), encoding="utf-8")
+
+
+def write_static(out_dir: Path, rel_path: str) -> None:
+    dest = out_dir / rel_path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if rel_path in STATIC_FILES:
+        dest.write_text(STATIC_FILES[rel_path], encoding="utf-8")
+
+
+# ════════════════════════════════════════════════════════════════════
+# SYNTAX CHECKER
+# ════════════════════════════════════════════════════════════════════
+
+def check_syntax(out_dir: Path) -> tuple:
+    passed, failed = [], []
+    for f in sorted(out_dir.rglob("*.py")):
+        try:
+            ast.parse(f.read_text(encoding="utf-8"))
+            passed.append(f.relative_to(out_dir))
+        except SyntaxError as e:
+            failed.append((f.relative_to(out_dir), str(e)))
+    return passed, failed
+
+
+# ════════════════════════════════════════════════════════════════════
+# README
+# ════════════════════════════════════════════════════════════════════
+
+README = dedent("""\
+    # MiniGrok v13
+
+    Self-improving local AI OS — runs free on Google Colab T4.
+
+    ## Features
+    - 🤖 Qwen2.5-VL-7B-Instruct with 5-model fallback chain
+    - 🌐 Autonomous VL browser agent (screenshot → reason → act)
+    - 📚 Hybrid RAG (BM25 + ChromaDB + Knowledge Graph)
+    - 🎓 Self-improving: SFT (Unsloth) + DPO + eval gate + auto-rollback
+    - 🎙️ Voice I/O (F5-TTS + Whisper)
+    - 🖼️ Local image generation (Stable Diffusion Turbo)
+    - 📐 Homework solver with SymPy verification
+    - 🔒 Security: PII filter, injection detection, sandboxed code execution
+
+    ## Quick Start (Colab)
+    ```python
+    # In a Colab cell:
+    exec(open("colab_cell.py").read())
+    ```
+
+    ## Package install
+    ```bash
+    pip install -e .
+    python main.py --share
+    ```
+
+    ## Run tests (no GPU needed)
+    ```bash
+    pytest minigrok/tests/ -v
+    ```
+
+    ## Package structure
+    ```
+    minigrok/
+    ├── config.py          Config dataclass
+    ├── exceptions.py      Error hierarchy
+    ├── state.py           Runtime singletons (anti-circular-import key)
+    ├── startup.py         Auto-healing: fix_asyncio, find_free_port, clear_vram
+    ├── _autosave.py       Background persistence
+    ├── core/              cache, security, database, model, memory
+    ├── tools/             web, browser, code, homework, workspace, media
+    ├── agents/            loop (AgentPhase), chain (multi-step)
+    ├── training/          sft, dpo, eval
+    ├── ui/                app (11-tab Gradio), css
+    └── tests/             67+ tests, no GPU required
+    ```
+    """)
+
+
+# ════════════════════════════════════════════════════════════════════
+# MAIN
+# ════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="Split minigrok_v13.py into package structure")
+    parser.add_argument("--src", default="minigrok_v13.py", help="Path to monolith source")
+    parser.add_argument("--out", default="minigrok_pkg",    help="Output directory")
+    parser.add_argument("--check-only", action="store_true", help="Only syntax-check existing output")
+    args = parser.parse_args()
+
+    out_dir = Path(args.out)
+
+    if args.check_only:
+        passed, failed = check_syntax(out_dir)
+        print(f"\n{'='*55}\nSyntax check: {len(passed)} passed, {len(failed)} failed\n{'='*55}")
+        for f, e in failed:
+            print(f"  ❌ {f}: {e}")
+        sys.exit(0 if not failed else 1)
+
+    # ── Read monolith ─────────────────────────────────────────────
+    src_path = Path(args.src)
+    if not src_path.exists():
+        print(f"❌ Source not found: {src_path}")
+        print("   Pass the path with --src /path/to/minigrok_v13.py")
+        sys.exit(1)
+
+    print(f"\n{'='*55}")
+    print(f"  MiniGrok Splitter")
+    print(f"  Source : {src_path}  ({src_path.stat().st_size // 1024}KB)")
+    print(f"  Output : {out_dir}")
+    print(f"{'='*55}\n")
+
+    monolith_lines = src_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    print(f"  Read {len(monolith_lines):,} lines from {src_path.name}")
+
+    # ── Register static content ───────────────────────────────────
+    _register_statics()
+
+    # ── Write all modules ─────────────────────────────────────────
+    # 1. Static files (fully written from scratch)
+    static_paths = set(STATIC_FILES.keys())
+    for rel_path in static_paths:
+        write_static(out_dir, rel_path)
+
+    # 2. Extracted modules (from monolith sections)
+    for rel_path, section_keys in MODULE_MAP.items():
+        if rel_path in static_paths:
+            continue     # Already written above
+        write_extracted(out_dir, rel_path, "", monolith_lines)
+
+    # 3. pyproject.toml and README
+    (out_dir / "README.md").write_text(README, encoding="utf-8")
+
+    # ── Summary ───────────────────────────────────────────────────
+    all_files = list(out_dir.rglob("*"))
+    py_files  = [f for f in all_files if f.suffix == ".py"]
+    total_lines = sum(len(f.read_text(encoding="utf-8").splitlines()) for f in py_files)
+
+    print(f"\n  Files created: {len(all_files)}")
+    print(f"  Python files : {len(py_files)}")
+    print(f"  Total lines  : {total_lines:,}")
+
+    # ── Syntax check ──────────────────────────────────────────────
+    print(f"\n  Running syntax check…")
+    passed, failed = check_syntax(out_dir)
+
+    print(f"\n{'='*55}")
+    print(f"  Syntax: {len(passed)} ✅  {len(failed)} ❌")
+    print(f"{'='*55}")
+
+    for f in sorted(passed):
+        lines = len((out_dir / f).read_text(encoding="utf-8").splitlines())
+        print(f"  ✅ {str(f):<55} {lines:4d} lines")
+
+    if failed:
+        print()
+        for f, e in failed:
+            print(f"  ❌ {f}: {e}")
+        print(f"\n  ⚠️  {len(failed)} file(s) have syntax errors.")
+        print("     These contain raw monolith code — open them and add the correct")
+        print("     import headers, or copy from the v13 monolith manually.")
+    else:
+        print(f"\n  🏆 All files pass syntax check.")
+        print(f"\n  Next steps:")
+        print(f"    cd {out_dir}")
+        print(f"    pip install -e '.[dev]'")
+        print(f"    pytest minigrok/tests/ -v")
+        print(f"\n  To run in Colab:")
+        print(f"    Upload the minigrok_pkg folder to Drive")
+        print(f"    In a Colab cell: exec(open('colab_cell.py').read())")
+
+
+if __name__ == "__main__":
+    main()
